@@ -1,120 +1,66 @@
-"""BTA Tariff Refund Lead Machine — discovery-to-queue pipeline.
-
-Stage 40 deliverable: turn ImportYeti discovery into two durable queues:
-1) CALL_READY: only leads with verified name + phone + email
-2) CONTACT_REQUIRED: qualified leads still missing verified contact data
-
-This module deliberately does not guess contact data. Enrichment adapters can add
-verified fields later; records remain in CONTACT_REQUIRED until complete.
-"""
+"""BTA Tariff Refund Lead Machine — discovery, scoring, dedupe, routing."""
 from __future__ import annotations
-
-import argparse
-import csv
-import json
+import argparse, csv, json
 from pathlib import Path
 from typing import Iterable
-
 from dedupe import split_new
 from importyeti_client import search_importers, normalize_company
+from qualify import qualify
+from validate_contacts import audit
 
-OUTPUT = Path("leadgen/output")
-EXISTING = OUTPUT / "existing_leads.json"
-CANDIDATES = OUTPUT / "importer_candidates.json"
-CALL_READY = OUTPUT / "call_ready.csv"
-CONTACT_REQUIRED = OUTPUT / "contact_required.csv"
-DUPLICATES = OUTPUT / "duplicates.json"
+OUTPUT=Path("leadgen/output")
+EXISTING=OUTPUT/"existing_leads.json"; CANDIDATES=OUTPUT/"importer_candidates.json"
+QUALIFIED=OUTPUT/"qualified_importers.csv"; CALL_READY=OUTPUT/"call_ready.csv"
+CONTACT_REQUIRED=OUTPUT/"contact_required.csv"; RESEARCH=OUTPUT/"research.csv"; DUPLICATES=OUTPUT/"duplicates.json"
+FIELDS=["company_id","company_name","address","shipments","last_shipment","origin_countries","website","domain","contact_name","contact_title","phone","email","phone_source","email_source","contact_source","qualification_score","qualification_tier","qualification_status","qualification_reason","lead_status"]
 
-FIELDS = [
-    "company_id", "company_name", "address", "shipments", "last_shipment",
-    "website", "domain", "contact_name", "contact_title", "phone", "email",
-    "phone_source", "email_source", "contact_source", "qualification_status",
-    "qualification_reason", "lead_status",
-]
+def _rows(payload):
+    raw=payload.get("data") or payload.get("results") or payload.get("companies") or []
+    rows=[]
+    for x in raw:
+        r=normalize_company(x)
+        # Preserve useful tariff evidence exposed by upstream records.
+        r["origin_countries"]=x.get("origin_countries") or x.get("countries") or x.get("country") or []
+        r["tariff_exposure"]=x.get("tariff_exposure") or x.get("tariffExposure")
+        r["website"]=x.get("website") or x.get("domain")
+        r["domain"]=x.get("domain")
+        rows.append(r)
+    return rows
 
+def load_json(path, default):
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
 
-def _rows(payload: dict) -> list[dict]:
-    raw = payload.get("data") or payload.get("results") or payload.get("companies") or []
-    return [normalize_company(x) for x in raw]
+def save_json(path,data):
+    path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(data,indent=2,default=str),encoding="utf-8")
 
+def write_csv(path,rows:Iterable[dict]):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open("w",newline="",encoding="utf-8-sig") as f:
+        w=csv.DictWriter(f,fieldnames=FIELDS,extrasaction="ignore"); w.writeheader()
+        for r in rows: w.writerow({k:r.get(k,"") for k in FIELDS})
 
-def load_json(path: Path, default):
-    if not path.exists():
-        return default
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-
-
-def verified(value, source) -> bool:
-    return bool(str(value or "").strip() and str(source or "").strip())
-
-
-def is_call_ready(row: dict) -> bool:
-    return (
-        bool(str(row.get("contact_name") or "").strip())
-        and verified(row.get("phone"), row.get("phone_source"))
-        and verified(row.get("email"), row.get("email_source"))
-    )
-
-
-def classify(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
-    ready, needs_contact = [], []
+def route(rows):
+    ready=[]; contact=[]; research=[]
     for row in rows:
-        row = dict(row)
-        if is_call_ready(row):
-            row["lead_status"] = "CALL_READY"
-            ready.append(row)
+        row=dict(row)
+        if row["qualification_status"]!="QUALIFIED":
+            row["lead_status"]="RESEARCH"; research.append(row); continue
+        check=audit(row)
+        if check["valid"]:
+            row["lead_status"]="CALL_READY"; ready.append(row)
         else:
-            row["lead_status"] = "CONTACT_REQUIRED"
-            needs_contact.append(row)
-    return ready, needs_contact
+            row["lead_status"]="CONTACT_REQUIRED"; row["contact_gaps"]=";".join(check["problems"]); contact.append(row)
+    return ready,contact,research
 
+def run(filters=None):
+    OUTPUT.mkdir(parents=True,exist_ok=True)
+    payload=search_importers(**(filters or {})); discovered=_rows(payload); save_json(CANDIDATES,discovered)
+    new_rows,duplicates=split_new(discovered,load_json(EXISTING,[])); save_json(DUPLICATES,duplicates)
+    ranked=qualify(new_rows); qualified=[r for r in ranked if r["qualification_status"]=="QUALIFIED"]
+    ready,contact,research=route(ranked)
+    write_csv(QUALIFIED,qualified); write_csv(CALL_READY,ready); write_csv(CONTACT_REQUIRED,contact); write_csv(RESEARCH,research)
+    return {"discovered":len(discovered),"new":len(new_rows),"duplicates":len(duplicates),"qualified":len(qualified),"call_ready":len(ready),"contact_required":len(contact),"research":len(research)}
 
-def write_csv(path: Path, rows: Iterable[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = list(rows)
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in FIELDS})
-
-
-def run(filters: dict | None = None) -> dict:
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    payload = search_importers(**(filters or {}))
-    discovered = _rows(payload)
-    save_json(CANDIDATES, discovered)
-
-    existing = load_json(EXISTING, [])
-    new_rows, duplicates = split_new(discovered, existing)
-    save_json(DUPLICATES, duplicates)
-
-    # Qualification/enrichment can populate these fields before reclassification.
-    ready, needs_contact = classify(new_rows)
-    write_csv(CALL_READY, ready)
-    write_csv(CONTACT_REQUIRED, needs_contact)
-
-    return {
-        "discovered": len(discovered),
-        "new": len(new_rows),
-        "duplicates": len(duplicates),
-        "call_ready": len(ready),
-        "contact_required": len(needs_contact),
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--filters-json", default="{}", help="ImportYeti PowerQuery filters as JSON")
-    args = parser.parse_args()
-    summary = run(json.loads(args.filters_json))
-    print(json.dumps(summary, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+def main():
+    p=argparse.ArgumentParser(); p.add_argument("--filters-json",default="{}"); a=p.parse_args(); print(json.dumps(run(json.loads(a.filters_json)),indent=2))
+if __name__=="__main__": main()
